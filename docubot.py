@@ -9,6 +9,19 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import string
+
+# Common filler words that match almost any text, so they don't count as evidence
+STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "be", "do", "does", "did",
+    "i", "my", "me", "you", "it", "in", "on", "of", "to", "for", "and",
+    "or", "with", "by", "at", "from", "what", "which", "where", "when",
+    "how", "who", "why", "there", "any", "these", "this", "that",
+    "mention", "docs",
+}
+
+# A chunk must share at least this many non-stopword words with the query
+MIN_KEYWORD_MATCHES = 1
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -21,6 +34,9 @@ class DocuBot:
 
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
+
+        # Split documents into smaller sections for retrieval
+        self.chunks = self.chunk_documents(self.documents)  # List of (filename, chunk_text)
 
         # Build a retrieval index (implemented in Phase 1)
         self.index = self.build_index(self.documents)
@@ -44,6 +60,24 @@ class DocuBot:
                 docs.append((filename, text))
         return docs
 
+    def chunk_documents(self, documents):
+        """
+        Splits each document into sections, starting a new chunk at every
+        markdown heading (a line beginning with '#').
+        Returns a list of tuples: (filename, chunk_text)
+        """
+        chunks = []
+        for filename, text in documents:
+            current = []
+            for line in text.splitlines():
+                if line.startswith("#") and current:
+                    chunks.append((filename, "\n".join(current).strip()))
+                    current = []
+                current.append(line)
+            if current:
+                chunks.append((filename, "\n".join(current).strip()))
+        return chunks
+
     # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
@@ -64,7 +98,15 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for word in text.lower().split():
+                word = word.strip(string.punctuation)
+                if not word:
+                    continue
+                if word not in index:
+                    index[word] = []
+                if filename not in index[word]:
+                    index[word].append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +123,26 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        text_words = set(w.strip(string.punctuation) for w in text.lower().split())
+        score = 0
+        for word in query.lower().split():
+            word = word.strip(string.punctuation)
+            if word and word in text_words:
+                score += 1
+        return score
+
+    def keyword_matches(self, query, text):
+        """
+        Guardrail helper: counts query words that appear in the text,
+        ignoring STOPWORDS, so filler words can't count as evidence.
+        """
+        text_words = set(w.strip(string.punctuation) for w in text.lower().split())
+        count = 0
+        for word in query.lower().split():
+            word = word.strip(string.punctuation)
+            if word and word not in STOPWORDS and word in text_words:
+                count += 1
+        return count
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,8 +151,24 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
+        # Use the index to find candidate documents containing any query word
+        candidates = set()
+        for word in query.lower().split():
+            word = word.strip(string.punctuation)
+            candidates.update(self.index.get(word, []))
+
         results = []
-        # TODO: implement retrieval logic
+        for filename, text in self.chunks:
+            if filename in candidates:
+                # Guardrail: skip chunks with no meaningful evidence
+                if self.keyword_matches(query, text) < MIN_KEYWORD_MATCHES:
+                    continue
+                score = self.score_document(query, text)
+                if score > 0:
+                    results.append((score, filename, text))
+
+        results.sort(key=lambda r: r[0], reverse=True)
+        results = [(filename, text) for _, filename, text in results]
         return results[:top_k]
 
     # -----------------------------------------------------------
@@ -107,7 +183,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return "I don't know based on these docs."
 
         formatted = []
         for filename, text in snippets:
@@ -129,7 +205,7 @@ class DocuBot:
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
-            return "I do not know based on these docs."
+            return "I don't know based on these docs."
 
         return self.llm_client.answer_from_snippets(query, snippets)
 
